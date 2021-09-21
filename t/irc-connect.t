@@ -23,12 +23,14 @@ $connection->conversation({name => '#convos'});
 $connection->conversation({name => 'private_ryan'});
 $connection->save_p->$wait_success;
 
-my (@connection_state, @state);
+my ($wait_for_connection_states_p, $wanted_connection_states, @connection_state, @state);
 $connection->on(
   state => sub {
     shift;
     push @connection_state, $_[1]->{state} if $_[0] eq 'connection';
     push @state,            [@_];
+    warn $wait_for_connection_states_p->resolve
+      if $wait_for_connection_states_p and @connection_state >= $wanted_connection_states;
   }
 );
 
@@ -57,29 +59,19 @@ is_deeply($connection->on_connect_commands,
   [@on_connect_commands], 'on_connect_commands still has the same elements');
 
 cmp_deeply(
-  [shift @state, shift @state],
+  [grep { $_->[0] eq 'frozen' } @state],
   superbagof(
     [frozen => superhashof({conversation_id => '#convos',      frozen => 'Not connected.'})],
     [frozen => superhashof({conversation_id => 'private_ryan', frozen => 'Not connected.'})],
   ),
-  'frozen'
-);
-
-cmp_deeply(
-  [pop @state, pop @state],
-  superbagof(
-    [frozen => superhashof({conversation_id => '#convos',      frozen => ''})],
-    [frozen => superhashof({conversation_id => 'private_ryan', frozen => ''})],
-  ),
-  'unfroze'
-);
+  'frozen and unfrozen'
+) or diag explain \@state;
 
 $connection->disconnect_p->$wait_success('disconnect_p');
 $connection->url(Mojo::URL->new('irc://irc.example.com'));
 $connection->url->query->param(local_address => '1.1.1.1');
 
 note 'reconnect on ssl error';
-@connection_state = ();
 mock_connect(
   errors => [
     'SSL connect attempt failed error:140770FC:SSL routines:SSL23_GET_SERVER_HELLO:unknown protocol',
@@ -87,8 +79,8 @@ mock_connect(
   ],
   sub {
     my $connect_args = shift;
-    $connection->connect_p->wait;
-    Mojo::IOLoop->one_tick until @connection_state == 2;
+    $connection->connect_p;
+    wait_for_connection_states(7);
 
     cmp_deeply $connect_args->[0],
       {
@@ -114,6 +106,9 @@ mock_connect(
 
     ok -s $connect_args->[0]{tls_cert}, 'tls_cert generated';
     ok -s $connect_args->[0]{tls_key},  'tls_key generated';
+    is_deeply \@connection_state,
+      [qw(disconnected queued connecting disconnected queued connecting connected)],
+      'connection_state';
   },
 );
 
@@ -122,29 +117,14 @@ mock_connect(
   errors => ['IO::Socket::SSL 1.94+ required for TLS support'],
   sub {
     $connection->url->query->remove('tls');
-    $connection->connect_p->wait;
-    Mojo::IOLoop->one_tick until @connection_state == 3;
-
+    $connection->disconnect_p->then(sub { $connection->connect_p });
+    wait_for_connection_states(4);
     is $connection->url->query->param('tls'), 0, 'tls off after missing module';
-    is_deeply \@connection_state, [qw(queued disconnected queued)],
-      'queued because of connect_queue';
-  }
-);
+    cmp_deeply [values %{$core->{connect_queue}}], [[[num(time, 5), $connection]]], 'connect_queue';
+    is_deeply \@connection_state, [qw(disconnected connecting disconnected queued)], 'queued';
 
-note 'successful connect';
-mock_connect(
-  stream => Mojo::IOLoop::Stream->new,
-  sub {
-    my $tid = Mojo::IOLoop->recurring(
-      0.1 => sub {
-        $core->_dequeue;
-        Mojo::IOLoop->stop if @connection_state == 4;
-      }
-    );
-    cmp_deeply [values %{$core->{connect_queue}}], [[$connection]], 'connect_queue';
-    Mojo::IOLoop->start;
-    Mojo::IOLoop->remove($tid);
-    is_deeply \@connection_state, [qw(queued disconnected queued connected)], 'connected';
+    wait_for_connection_states(2);
+    is_deeply \@connection_state, [qw(connecting connected)], 'connected';
   }
 );
 
@@ -161,12 +141,21 @@ sub core { Convos::Core->new(backend => 'Convos::Core::Backend::File') }
 sub mock_connect {
   my ($cb, %args) = (pop, @_);
   my @connect_args;
-  no warnings 'redefine';
+  no warnings qw(redefine);
   local *Mojo::IOLoop::client = sub {
     my ($loop, $connect_args, $cb) = @_;
     push @connect_args, $connect_args;
-    Mojo::IOLoop->next_tick(sub { $cb->($loop, shift @{$args{errors}}, $args{stream}) });
+    Mojo::IOLoop->next_tick(
+      sub { $cb->($loop, shift @{$args{errors}}, $args{stream} || Mojo::IOLoop::Stream->new) });
     return rand;
   };
   $cb->(\@connect_args);
+}
+
+sub wait_for_connection_states {
+  $wanted_connection_states     = shift;
+  @connection_state             = ();
+  $wait_for_connection_states_p = Mojo::Promise->new;
+  Mojo::Promise->race($wait_for_connection_states_p, Mojo::Promise->timer(2))->wait;
+  note join ', ', @connection_state;
 }

@@ -6,6 +6,7 @@ use Convos::Core::ConnectionProfile;
 use Convos::Core::Settings;
 use Convos::Core::User;
 use Convos::Util qw(DEBUG has_many);
+use List::Util qw(sum0);
 use Mojo::File;
 use Mojo::Log;
 use Mojo::URL;
@@ -13,25 +14,30 @@ use Mojo::Util qw(trim);
 use Mojolicious::Plugins;
 use Scalar::Util qw(blessed weaken);
 
-has backend  => sub { Convos::Core::Backend->new };
-has home     => sub { Mojo::File->new(split '/', $ENV{CONVOS_HOME}); };
-has log      => sub { Mojo::Log->new };
-has ready    => 0;
-has settings => sub { Convos::Core::Settings->new(core => shift) };
+has backend       => sub { Convos::Core::Backend->new };
+has connect_delay => sub { $ENV{CONVOS_CONNECT_DELAY} || 4 };
+has home          => sub { Mojo::File->new(split '/', $ENV{CONVOS_HOME}); };
+has log           => sub { Mojo::Log->new };
+has ready         => 0;
+has settings      => sub { Convos::Core::Settings->new(core => shift) };
 
 sub connect {
-  my ($self, $connection, $reason) = @_;
+  my ($self, $connection, $reconnect_delay) = @_;
   return $self if $connection->wanted_state eq 'disconnected';
 
-  $connection->state(queued => $reason || 'Connecting soon...');
-
-  my $host = $connection->url->host;
-  if ($connection->profile->skip_queue and !$reason) {
+  my $host  = $connection->url->host;
+  my $delay = $reconnect_delay ? $reconnect_delay * $self->connect_delay : 0;
+  if ($connection->profile->skip_queue and !$delay) {
     $connection->connect_p;
   }
-  elsif ($self->{connect_queue}{$host} or $reason) {
-    push @{$self->{connect_queue}{$host}}, $connection;
-    weaken($self->{connect_queue}{$host}[-1]);
+  elsif ($self->{connect_queue}{$host} or $delay) {
+    my $q = $self->{connect_queue}{$host} ||= [];
+    unless (grep { $connection eq $_->[1] } @$q) {
+      $connection->state(queued => $delay ? "Reconnecting after ${delay}s..." : 'Queued...');
+      push @$q, [$delay + time, $connection];
+      weaken($q->[-1][1]);
+      @$q = sort { $a->[0] <=> $b->[0] } @$q;
+    }
   }
   else {
     $self->{connect_queue}{$host} ||= [];
@@ -39,6 +45,11 @@ sub connect {
   }
 
   return $self;
+}
+
+sub connect_queue_size {
+  my $self = shift;
+  return sum0 map { int @{$self->{connect_queue}{$_}} } keys %{$self->{connect_queue} || {}};
 }
 
 has_many connection_profiles => 'Convos::Core::ConnectionProfile' => sub {
@@ -111,8 +122,7 @@ sub start {
   });
 
   weaken($self);
-  $self->{connect_tid}
-    = Mojo::IOLoop->recurring($ENV{CONVOS_CONNECT_DELAY} || 4, sub { $self->_dequeue });
+  $self->{connect_tid} = Mojo::IOLoop->recurring($self->connect_delay, sub { $self->_dequeue });
 
   return $self;
 }
@@ -143,8 +153,14 @@ sub web_url {
 sub _dequeue {
   my $self = shift;
 
+  my $now = time;
   for my $host (keys %{$self->{connect_queue} || {}}) {
-    next unless my $connection = shift @{$self->{connect_queue}{$host}};
+    my $q = $self->{connect_queue}{$host};
+    my $i = $q->[0];
+    last if $i->[0] < $now;
+    shift @$q;                               # Remove the item that will be connected
+    delete $self->{connect_queue}{$host} unless @$q;
+    next unless my $connection = $i->[1];    # In case it has been destroyed
     $connection->connect_p if $connection and $connection->wanted_state eq 'connected';
   }
 }
@@ -222,6 +238,13 @@ the following new ones.
 
 Holds a L<Convos::Core::Backend> object.
 
+=head2 connect_delay
+
+  $int = $self->connect_delay;
+
+How many seconds before attempting to connect the next connection to the same
+IRC server.
+
 =head2 home
 
   $obj = $core->home;
@@ -261,6 +284,12 @@ fails.
 
 C<$cb> is optional, but will be passed on to
 L<Convos::Core::Connection/connect> if defined.
+
+=head2 connect_queue_size
+
+  $i = $core->connect_queue_size;
+
+Returns the number of connections waiting to connect.
 
 =head2 connection_profile
 

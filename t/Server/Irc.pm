@@ -94,7 +94,7 @@ sub start {
       $stream->timeout(0);
       $stream->on(close => sub { delete $self->{connections}{$_[0]} });
       $stream->on(read  => sub { $s_conn->_stream_on_read(@_) });
-      $self->emit(connection => $s_conn);
+      $self->emit(connection => $s_conn, $stream);
       $s_conn->write($self->_data_section('start.irc'));
     }
   );
