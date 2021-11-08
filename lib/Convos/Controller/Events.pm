@@ -21,6 +21,9 @@ sub start {
   return $self->_err('Need to log in first.', {method => 'handshake'})->finish(1008)
     unless my $user = $self->backend->user;
 
+  # Cancel disconnect
+  $self->backend->user->disconnect_later(0);
+
   weaken $self;
   my $uid     = $user->id;
   my $backend = $self->app->core->backend;
@@ -37,6 +40,7 @@ sub start {
     finish => sub {
       warn "[Convos::Controller::Events] !!! Finish\n" if DEBUG >= 2;
       $backend->unsubscribe("user:$uid" => $cb);
+      $self->backend->user->disconnect_later(60);
     }
   );
 

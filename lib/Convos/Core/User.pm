@@ -48,6 +48,26 @@ has_many connections => 'Convos::Core::Connection' => sub {
   return $connection;
 };
 
+sub disconnect_later {
+  my ($self, $later) = @_;
+
+  # Remove disconnect timer
+  Mojo::IOLoop->remove($self->{disconnect_later_tid}) if $self->{disconnect_later_tid};
+
+  # Do not set a new timer
+  return $self unless $later;
+
+  Scalar::Util::weaken($self);
+  $self->{disconnect_later_tid} = Mojo::IOLoop->timer(
+    $later => sub {
+      return unless $self;
+      for my $connection (@{$self->connections}) {
+        $connection->disconnect;
+      }
+    }
+  );
+}
+
 sub get_p {
   my ($self, $args) = @_;
   my $res = $self->TO_JSON;
